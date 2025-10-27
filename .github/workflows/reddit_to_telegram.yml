@@ -38,6 +38,7 @@ jobs:
           LIMIT: "25"
           CHAR_LIMIT: "200"
           STATE_FILE: state_reddit_ids.json
+          # USER_AGENT: "VM-Reddit-TG-Bot/2.0 (by u/YourUserName; GitHub Actions)" # <- можно вынести в Variables
         run: |
           python reddit_to_telegram_bot.py
 
