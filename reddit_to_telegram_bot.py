@@ -1,91 +1,144 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Reddit (OAuth) → Telegram poster for /r/<SUBREDDIT>/<LISTING> with 200-char captions
+and playable Reddit videos in Telegram.
+"""
 
 import os
 import json
 import time
 import html
+import time as _time
 from typing import Dict, Any, Optional, List
 import requests
+from requests.auth import HTTPBasicAuth
 
-REDDIT_BASE = "https://www.reddit.com"
-HEADERS = {
-    "User-Agent": "VM-Reddit-TG-Bot/1.0 (by u/your_reddit_username)"
-}
+REDDIT_OAUTH = "https://oauth.reddit.com"
+REDDIT_AUTH = "https://www.reddit.com/api/v1/access_token"
 
+USER_AGENT = os.environ.get(
+    "USER_AGENT",
+    "VM-Reddit-TG-Bot/2.0 (by u/YourUserName; GitHub Actions)"
+)
+
+# Telegram
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
+# Reddit OAuth
+REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
+REDDIT_USERNAME = os.environ.get("REDDIT_USERNAME")
+REDDIT_PASSWORD = os.environ.get("REDDIT_PASSWORD")
+
+# Bot behavior
 SUBREDDIT = os.environ.get("SUBREDDIT", "nba")
 LISTING = os.environ.get("LISTING", "hot")  # hot, new, top
 LIMIT = int(os.environ.get("LIMIT", "25"))
 CHAR_LIMIT = int(os.environ.get("CHAR_LIMIT", "200"))
 STATE_FILE = os.environ.get("STATE_FILE", "state_reddit_ids.json")
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
+session = requests.Session()
+session.headers.update({"User-Agent": USER_AGENT})
+
+# cache oauth token in-process
+_OAUTH_TOKEN = None
+_TOKEN_EXP = 0  # epoch seconds
+
+
+def oauth_token() -> str:
+    """Get (and cache) OAuth token via password grant."""
+    global _OAUTH_TOKEN, _TOKEN_EXP
+    now = int(_time.time())
+    if _OAUTH_TOKEN and now < _TOKEN_EXP - 30:
+        return _OAUTH_TOKEN
+
+    if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and REDDIT_USERNAME and REDDIT_PASSWORD):
+        raise SystemExit("Missing Reddit OAuth env vars: REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD")
+
+    auth = HTTPBasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
+    data = {
+        "grant_type": "password",
+        "username": REDDIT_USERNAME,
+        "password": REDDIT_PASSWORD,
+    }
+    headers = {"User-Agent": USER_AGENT}
+    r = requests.post(REDDIT_AUTH, auth=auth, data=data, headers=headers, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    token = js.get("access_token")
+    ttl = int(js.get("expires_in") or 3600)
+    if not token:
+        raise RuntimeError(f"Failed to get access_token: {r.text}")
+
+    _OAUTH_TOKEN = token
+    _TOKEN_EXP = now + ttl
+    return token
+
+
+def reddit_get(path: str, params: Optional[dict] = None) -> requests.Response:
+    token = oauth_token()
+    headers = {"Authorization": f"bearer {token}", "User-Agent": USER_AGENT}
+    url = f"{REDDIT_OAUTH}{path}"
+    r = session.get(url, headers=headers, params=params or {}, timeout=30)
+    # If unauthorized/forbidden (token expired or scope), retry once
+    if r.status_code in (401, 403):
+        token = oauth_token()
+        headers["Authorization"] = f"bearer {token}"
+        r = session.get(url, headers=headers, params=params or {}, timeout=30)
+    r.raise_for_status()
+    return r
+
 
 def load_state() -> Dict[str, bool]:
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            try:
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
-            except Exception:
-                return {}
+        except Exception:
+            return {}
     return {}
+
 
 def save_state(state: Dict[str, bool]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
+
 def truncate(text: str, max_len: int) -> str:
-    if len(text) <= max_len:
-        return text
-    return text[:max_len-1].rstrip() + "…"
+    text = text.strip().replace("\n", " ")
+    return text if len(text) <= max_len else text[: max_len - 1].rstrip() + "…"
+
 
 def build_caption(title: str, permalink: str) -> str:
-    title = title.replace("\n", " ").strip()
     short = truncate(title, CHAR_LIMIT)
-    link = f"{REDDIT_BASE}{permalink}"
-    # Use HTML to avoid markdown escaping hell
+    link = f"https://www.reddit.com{permalink}"
     caption = f"{html.escape(short)}\n<a href=\"{html.escape(link)}\">Читать на Reddit →</a>"
     return caption
 
-def send_message(text: str) -> requests.Response:
+
+def tg_send(endpoint: str, payload: dict, timeout: int = 60) -> requests.Response:
     assert TG_API and CHAT_ID, "Telegram config missing"
-    url = f"{TG_API}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-    return requests.post(url, data=payload, timeout=30)
+    url = f"{TG_API}/{endpoint}"
+    payload = {"chat_id": CHAT_ID, **payload}
+    return session.post(url, data=payload, timeout=timeout)
+
+
+def send_message(text: str) -> requests.Response:
+    return tg_send("sendMessage", {"text": text, "parse_mode": "HTML", "disable_web_page_preview": False}, timeout=60)
+
 
 def send_photo(photo_url: str, caption: str) -> requests.Response:
-    assert TG_API and CHAT_ID, "Telegram config missing"
-    url = f"{TG_API}/sendPhoto"
-    payload = {
-        "chat_id": CHAT_ID,
-        "photo": photo_url,
-        "caption": caption,
-        "parse_mode": "HTML"
-    }
-    return requests.post(url, data=payload, timeout=60)
+    return tg_send("sendPhoto", {"photo": photo_url, "caption": caption, "parse_mode": "HTML"}, timeout=90)
+
 
 def send_video(video_url: str, caption: str) -> requests.Response:
-    assert TG_API and CHAT_ID, "Telegram config missing"
-    url = f"{TG_API}/sendVideo"
-    payload = {
-        "chat_id": CHAT_ID,
-        "video": video_url,
-        "caption": caption,
-        "parse_mode": "HTML",
-        "supports_streaming": True
-    }
-    return requests.post(url, data=payload, timeout=120)
+    return tg_send("sendVideo", {"video": video_url, "caption": caption, "parse_mode": "HTML", "supports_streaming": True}, timeout=120)
+
 
 def first_gallery_image(post: Dict[str, Any]) -> Optional[str]:
-    # Reddit gallery: fetch the first original (s) or largest preview (p[-1]) image
     media_md = post.get("media_metadata")
     gallery = post.get("gallery_data")
     if not media_md or not gallery:
@@ -101,15 +154,20 @@ def first_gallery_image(post: Dict[str, Any]) -> Optional[str]:
         return None
     return None
 
+
 def extract_crosspost_root(d: Dict[str, Any]) -> Dict[str, Any]:
-    # Some posts are crossposts; prefer the original payload for media
     xlist = d.get("crosspost_parent_list")
     if isinstance(xlist, list) and xlist:
         return xlist[0]
     return d
 
+
 def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
-    post_id = d["name"]  # e.g., t3_abcd
+    # Skip уже отправленные и закреплённые (stickied) посты (как правило, "Game Thread" и т.п.)
+    if d.get("stickied"):
+        return
+
+    post_id = d.get("name") or f"t3_{d.get('id')}"
     if post_id in state:
         return
 
@@ -121,13 +179,10 @@ def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
     is_video = d.get("is_video", False)
 
     root = extract_crosspost_root(d)
-
     caption = build_caption(title, permalink)
-
     sent_ok = False
 
     try:
-        # 1) Reddit hosted video
         if is_video or post_hint == "hosted:video":
             rv = (root.get("secure_media") or root.get("media") or {}).get("reddit_video") or {}
             fallback = rv.get("fallback_url")
@@ -135,39 +190,30 @@ def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
                 r = send_video(fallback, caption)
                 sent_ok = r.ok
             else:
-                # fallback to link
-                text = f"{caption}\n\n{html.escape(url or (REDDIT_BASE + permalink))}"
+                text = f"{caption}\n\n{html.escape(url or ('https://www.reddit.com' + permalink))}"
                 r = send_message(text)
                 sent_ok = r.ok
-
-        # 2) Rich video (e.g., YouTube, Streamable) -> send link so Telegram embeds
         elif post_hint == "rich:video" and url:
+            # YouTube/Streamable — шлём ссылкой, Telegram сам встроит плеер.
             text = f"{caption}\n\n{html.escape(url)}"
             r = send_message(text)
             sent_ok = r.ok
-
-        # 3) Gallery -> first image
         elif is_gallery:
             img = first_gallery_image(root)
             if img:
                 r = send_photo(img, caption)
                 sent_ok = r.ok
             else:
-                text = f"{caption}\n\n{html.escape(url or (REDDIT_BASE + permalink))}"
+                text = f"{caption}\n\n{html.escape(url or ('https://www.reddit.com' + permalink))}"
                 r = send_message(text)
                 sent_ok = r.ok
-
-        # 4) Single image
         elif post_hint == "image" and url:
             r = send_photo(url, caption)
             sent_ok = r.ok
-
-        # 5) Link or self-post (text)
         else:
-            text = f"{caption}\n\n{html.escape(url or (REDDIT_BASE + permalink))}"
+            text = f"{caption}\n\n{html.escape(url or ('https://www.reddit.com' + permalink))}"
             r = send_message(text)
             sent_ok = r.ok
-
     except Exception as e:
         print("ERROR sending:", repr(e))
         sent_ok = False
@@ -178,23 +224,26 @@ def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
     else:
         print("Failed to send post:", post_id, "-", title[:80])
 
+
 def fetch_listing(subreddit: str, listing: str, limit: int) -> List[Dict[str, Any]]:
-    api = f"{REDDIT_BASE}/r/{subreddit}/{listing}.json"
+    path = f"/r/{subreddit}/{listing}.json"
     params = {"limit": limit}
-    res = requests.get(api, headers=HEADERS, params=params, timeout=30)
-    res.raise_for_status()
+    res = reddit_get(path, params=params)
     js = res.json()
     children = js.get("data", {}).get("children", [])
     return [c["data"] for c in children]
 
+
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         raise SystemExit("Missing BOT_TOKEN or CHAT_ID env variables")
+
     state = load_state()
     posts = fetch_listing(SUBREDDIT, LISTING, LIMIT)
-    # Send oldest first so chat order is natural
+    # Send oldest first для естественного порядка в чате
     for d in reversed(posts):
         handle_post(d, state)
+
 
 if __name__ == "__main__":
     main()
