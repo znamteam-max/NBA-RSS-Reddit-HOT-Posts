@@ -7,27 +7,29 @@ and playable Reddit videos in Telegram.
 
 import os
 import json
-import time
 import html
-import time as _time
+import time
 from typing import Dict, Any, Optional, List
+
 import requests
 from requests.auth import HTTPBasicAuth
 
+# Reddit OAuth endpoints
 REDDIT_OAUTH = "https://oauth.reddit.com"
 REDDIT_AUTH = "https://www.reddit.com/api/v1/access_token"
 
+# Give Reddit a clear, unique User-Agent
 USER_AGENT = os.environ.get(
     "USER_AGENT",
     "VM-Reddit-TG-Bot/2.0 (by u/YourUserName; GitHub Actions)"
 )
 
-# Telegram
+# Telegram config
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
-# Reddit OAuth
+# Reddit OAuth secrets (set via GitHub Secrets or env)
 REDDIT_CLIENT_ID = os.environ.get("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.environ.get("REDDIT_CLIENT_SECRET")
 REDDIT_USERNAME = os.environ.get("REDDIT_USERNAME")
@@ -35,34 +37,38 @@ REDDIT_PASSWORD = os.environ.get("REDDIT_PASSWORD")
 
 # Bot behavior
 SUBREDDIT = os.environ.get("SUBREDDIT", "nba")
-LISTING = os.environ.get("LISTING", "hot")  # hot, new, top
+LISTING = os.environ.get("LISTING", "hot")  # hot | new | top
 LIMIT = int(os.environ.get("LIMIT", "25"))
 CHAR_LIMIT = int(os.environ.get("CHAR_LIMIT", "200"))
 STATE_FILE = os.environ.get("STATE_FILE", "state_reddit_ids.json")
 
+# Requests session
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
 
-# cache oauth token in-process
-_OAUTH_TOKEN = None
-_TOKEN_EXP = 0  # epoch seconds
+# In-process OAuth token cache
+_OAUTH_TOKEN: Optional[str] = None
+_TOKEN_EXP: int = 0  # epoch seconds
 
 
 def oauth_token() -> str:
     """Get (and cache) OAuth token via password grant."""
     global _OAUTH_TOKEN, _TOKEN_EXP
-    now = int(_time.time())
+    now = int(time.time())
     if _OAUTH_TOKEN and now < _TOKEN_EXP - 30:
         return _OAUTH_TOKEN
 
     if not (REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and REDDIT_USERNAME and REDDIT_PASSWORD):
-        raise SystemExit("Missing Reddit OAuth env vars: REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD")
+        raise SystemExit(
+            "Missing Reddit OAuth env vars: REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USERNAME, REDDIT_PASSWORD"
+        )
 
     auth = HTTPBasicAuth(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET)
     data = {
         "grant_type": "password",
         "username": REDDIT_USERNAME,
         "password": REDDIT_PASSWORD,
+        # scope not required for script apps to read public subs, but you can add: "scope": "read"
     }
     headers = {"User-Agent": USER_AGENT}
     r = requests.post(REDDIT_AUTH, auth=auth, data=data, headers=headers, timeout=30)
@@ -79,11 +85,11 @@ def oauth_token() -> str:
 
 
 def reddit_get(path: str, params: Optional[dict] = None) -> requests.Response:
+    """GET to oauth.reddit.com with bearer; retry once on 401/403."""
     token = oauth_token()
     headers = {"Authorization": f"bearer {token}", "User-Agent": USER_AGENT}
     url = f"{REDDIT_OAUTH}{path}"
     r = session.get(url, headers=headers, params=params or {}, timeout=30)
-    # If unauthorized/forbidden (token expired or scope), retry once
     if r.status_code in (401, 403):
         token = oauth_token()
         headers["Authorization"] = f"bearer {token}"
@@ -115,8 +121,7 @@ def truncate(text: str, max_len: int) -> str:
 def build_caption(title: str, permalink: str) -> str:
     short = truncate(title, CHAR_LIMIT)
     link = f"https://www.reddit.com{permalink}"
-    caption = f"{html.escape(short)}\n<a href=\"{html.escape(link)}\">Читать на Reddit →</a>"
-    return caption
+    return f"{html.escape(short)}\n<a href=\"{html.escape(link)}\">Читать на Reddit →</a>"
 
 
 def tg_send(endpoint: str, payload: dict, timeout: int = 60) -> requests.Response:
@@ -135,7 +140,11 @@ def send_photo(photo_url: str, caption: str) -> requests.Response:
 
 
 def send_video(video_url: str, caption: str) -> requests.Response:
-    return tg_send("sendVideo", {"video": video_url, "caption": caption, "parse_mode": "HTML", "supports_streaming": True}, timeout=120)
+    return tg_send(
+        "sendVideo",
+        {"video": video_url, "caption": caption, "parse_mode": "HTML", "supports_streaming": True},
+        timeout=120,
+    )
 
 
 def first_gallery_image(post: Dict[str, Any]) -> Optional[str]:
@@ -163,7 +172,7 @@ def extract_crosspost_root(d: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
-    # Skip уже отправленные и закреплённые (stickied) посты (как правило, "Game Thread" и т.п.)
+    # пропускаем закреплённые посты
     if d.get("stickied"):
         return
 
@@ -193,11 +202,13 @@ def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
                 text = f"{caption}\n\n{html.escape(url or ('https://www.reddit.com' + permalink))}"
                 r = send_message(text)
                 sent_ok = r.ok
+
         elif post_hint == "rich:video" and url:
-            # YouTube/Streamable — шлём ссылкой, Telegram сам встроит плеер.
+            # YouTube/Streamable: Telegram сам встраивает плеер по ссылке
             text = f"{caption}\n\n{html.escape(url)}"
             r = send_message(text)
             sent_ok = r.ok
+
         elif is_gallery:
             img = first_gallery_image(root)
             if img:
@@ -207,13 +218,16 @@ def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
                 text = f"{caption}\n\n{html.escape(url or ('https://www.reddit.com' + permalink))}"
                 r = send_message(text)
                 sent_ok = r.ok
+
         elif post_hint == "image" and url:
             r = send_photo(url, caption)
             sent_ok = r.ok
+
         else:
             text = f"{caption}\n\n{html.escape(url or ('https://www.reddit.com' + permalink))}"
             r = send_message(text)
             sent_ok = r.ok
+
     except Exception as e:
         print("ERROR sending:", repr(e))
         sent_ok = False
@@ -240,7 +254,7 @@ def main():
 
     state = load_state()
     posts = fetch_listing(SUBREDDIT, LISTING, LIMIT)
-    # Send oldest first для естественного порядка в чате
+    # отправляем старые → новые, чтобы порядок в чате был естественный
     for d in reversed(posts):
         handle_post(d, state)
 
