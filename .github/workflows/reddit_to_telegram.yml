@@ -35,6 +35,9 @@ jobs:
           REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
           USER_AGENT: "VM-NBA-Bot/2.3 (by u/znambo; GitHub Actions)"
           FORCE_PROXY: "1"
+          PING_ON_START: "1"       # отправить тестовое сообщение при старте
+          FORCE_POST_ONE: "1"      # игнорировать state и отправить 1 верхний пост принудительно
+          MEDIA_MODE: "auto"       # можно временно поставить "text_only" для диагностики
           SUBREDDIT: nba
           LISTING: hot
           LIMIT: "25"
