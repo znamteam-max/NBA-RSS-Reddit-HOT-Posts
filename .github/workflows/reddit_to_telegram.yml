@@ -34,6 +34,7 @@ jobs:
           REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
           REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
           USER_AGENT: "VM-NBA-Bot/2.3 (by u/znambo; GitHub Actions)"
+          FORCE_PROXY: "1"
           SUBREDDIT: nba
           LISTING: hot
           LIMIT: "25"
