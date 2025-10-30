@@ -33,6 +33,7 @@ jobs:
           REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
           REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
           REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
+          USER_AGENT: "VM-NBA-Bot/2.3 (by u/znambo; GitHub Actions)"
           SUBREDDIT: nba
           LISTING: hot
           LIMIT: "25"
