@@ -35,8 +35,8 @@ from requests.auth import HTTPBasicAuth
 
 REDDIT_OAUTH = "https://oauth.reddit.com"
 REDDIT_AUTH = "https://www.reddit.com/api/v1/access_token"
-REDDIT_WEB  = "http://www.reddit.com"  # для fallback через Jina
-JINA_PROXY  = "https://r.jina.ai"
+REDDIT_WEB  = "https://www.reddit.com"  # раньше стоял http
+JINA_PROXY  = os.environ.get("JINA_PROXY", "https://r.jina.ai")
 
 USER_AGENT = os.environ.get(
     "USER_AGENT",
