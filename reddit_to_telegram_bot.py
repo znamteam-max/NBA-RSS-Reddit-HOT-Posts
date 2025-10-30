@@ -62,6 +62,9 @@ BODY_CHAR_LIMIT = int(os.environ.get("BODY_CHAR_LIMIT", "600"))  # лимит т
 COMMENTS_COUNT = int(os.environ.get("COMMENTS_COUNT", "3"))      # сколько топ-комментов
 COMMENT_CHAR_LIMIT = int(os.environ.get("COMMENT_CHAR_LIMIT", "220"))
 STATE_FILE = os.environ.get("STATE_FILE", "state_reddit_ids.json")
+PING_ON_START = os.environ.get("PING_ON_START", "0") == "1"
+FORCE_POST_ONE = os.environ.get("FORCE_POST_ONE", "0") == "1"
+MEDIA_MODE = os.environ.get("MEDIA_MODE", "auto")  # "auto" | "text_only"
 
 # Ограничения Telegram
 TG_CAPTION_LIMIT = 1024   # подпись к медиа
@@ -256,6 +259,12 @@ def fetch_top_comments(post_id36: str, count: int) -> List[Tuple[str, int, str]]
     return rows[:max(0, count)]
 
 # ------------------------ Telegram ------------------------
+
+def send_startup_ping():
+    try:
+        send_message("🚀 Бот запущен: проверка связи")
+    except Exception as e:
+        log(f"Startup ping failed: {e}")
 
 def tg_send(endpoint: str, payload: dict, timeout: int = 60) -> requests.Response:
     assert TG_API and CHAT_ID, "Telegram config missing"
