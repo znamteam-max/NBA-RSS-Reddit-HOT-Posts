@@ -190,21 +190,23 @@ def reddit_json_via_oauth(path: str, params: Optional[dict] = None, max_retries:
     r.raise_for_status()  # пробросит последнюю ошибку
 
 def reddit_json_via_proxy(path: str, params: Optional[dict] = None) -> dict:
-    """GET через Jina proxy, который скачивает страничку Reddit и отдаёт её контент."""
+    """GET через Jina proxy. ВАЖНО: корректно собрать URL с протоколом и слешем."""
     params = dict(params or {})
     if "raw_json" not in params:
         params["raw_json"] = 1
-    # Собираем URL вида: https://r.jina.ai/http://www.reddit.com<path>?...
-    url = f"{JINA_PROXY}{REDDIT_WEB}{path}"
+
+    base = JINA_PROXY.rstrip('/')                      # 'https://r.jina.ai'
+    target = f"{REDDIT_WEB}{path}"                     # 'https://www.reddit.com/r/nba/hot.json'
+    url = f"{base}/{target}"                           # 'https://r.jina.ai/https://www.reddit.com/...'
+    log(f"Proxy GET {url}")
+
     r = session.get(url, params=params, timeout=30, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
     r.raise_for_status()
-    # Jina отдаёт текст ответа той страницы. Для JSON это JSON-строка.
     text = r.text
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Бывает, что Jina отдаёт HTML — попробуем вычленить JSON-блок (редко нужно).
-        raise RuntimeError(f"Proxy returned non-JSON for {path}: {text[:400]}")
+        raise RuntimeError(f"Proxy returned non-JSON for {url}: {text[:400]}")
 
 def reddit_json(path: str, params: Optional[dict] = None) -> dict:
     """
