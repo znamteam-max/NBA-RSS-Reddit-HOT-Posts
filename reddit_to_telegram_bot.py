@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Reddit (OAuth) → Telegram poster
+Reddit → Telegram (устойчивый к 403):
+1) Пытаемся OAuth: https://oauth.reddit.com
+2) При 403/429/451/сетевых ошибках — fallback на прокси:
+   https://r.jina.ai/http://www.reddit.com<path>?...
 
-Формат сообщения:
+Сообщение в Telegram:
 <b>Заголовок</b>
 --------
 Первые N символов текста поста (BODY_CHAR_LIMIT)
@@ -11,14 +14,11 @@ Reddit (OAuth) → Telegram poster
 • u/author1 (+score1): коммент1
 • u/author2 (+score2): коммент2
 • u/author3 (+score3): коммент3
+(Затем «Читать на Reddit →»)
 
-Скрипт:
-- получает OAuth токен (password grant, scope=read);
-- ходит только на https://oauth.reddit.com;
-- ставит корректный уникальный User-Agent;
-- использует Accept: application/json и raw_json=1;
-- имеет ретраи с экспонентой на 403/429/5xx и детальную диагностику;
-- поддерживает отправку видео, фото, галерей и текстовых постов.
+Поддержка:
+- видео Reddit: sendVideo(supports_streaming=True) с fallback_url (играет в Telegram)
+- изображения, галереи, ссылочные посты
 """
 
 import os
@@ -35,10 +35,12 @@ from requests.auth import HTTPBasicAuth
 
 REDDIT_OAUTH = "https://oauth.reddit.com"
 REDDIT_AUTH = "https://www.reddit.com/api/v1/access_token"
+REDDIT_WEB  = "http://www.reddit.com"  # для fallback через Jina
+JINA_PROXY  = "https://r.jina.ai"
 
 USER_AGENT = os.environ.get(
     "USER_AGENT",
-    "VM-Reddit-TG-Bot/2.3 (by u/YourUserName; GitHub Actions)"
+    "VM-Reddit-TG-Bot/2.4 (by u/YourUserName; GitHub Actions)"
 )
 
 # Telegram
@@ -55,23 +57,22 @@ REDDIT_PASSWORD = os.environ.get("REDDIT_PASSWORD")
 # Поведение бота
 SUBREDDIT = os.environ.get("SUBREDDIT", "nba")
 LISTING = os.environ.get("LISTING", "hot")  # hot | new | top
-TITLE_CHAR_LIMIT = int(os.environ.get("CHAR_LIMIT", "200"))
-BODY_CHAR_LIMIT = int(os.environ.get("BODY_CHAR_LIMIT", "600"))
-COMMENTS_COUNT = int(os.environ.get("COMMENTS_COUNT", "3"))
+TITLE_CHAR_LIMIT = int(os.environ.get("CHAR_LIMIT", "200"))      # лимит заголовка
+BODY_CHAR_LIMIT = int(os.environ.get("BODY_CHAR_LIMIT", "600"))  # лимит текста поста
+COMMENTS_COUNT = int(os.environ.get("COMMENTS_COUNT", "3"))      # сколько топ-комментов
 COMMENT_CHAR_LIMIT = int(os.environ.get("COMMENT_CHAR_LIMIT", "220"))
 STATE_FILE = os.environ.get("STATE_FILE", "state_reddit_ids.json")
 
 # Ограничения Telegram
 TG_CAPTION_LIMIT = 1024   # подпись к медиа
-TG_MESSAGE_LIMIT = 4096   # обычное текстовое сообщение
+TG_MESSAGE_LIMIT = 4096   # обычное сообщение
 
-# HTTP session и заголовки
+# HTTP session
 session = requests.Session()
 _device_id = str(uuid.uuid4())
 session.headers.update({
     "User-Agent": USER_AGENT,
     "Accept": "application/json",
-    # X-Reddit-Device-Id не обязателен, но иногда помогает
     "X-Reddit-Device-Id": _device_id,
 })
 
@@ -79,7 +80,7 @@ session.headers.update({
 _OAUTH_TOKEN: Optional[str] = None
 _TOKEN_EXP: int = 0  # epoch seconds
 
-# ------------------------ Вспомогательные функции ------------------------
+# ------------------------ Утилиты ------------------------
 
 def log(msg: str) -> None:
     print(f"[reddit2tg] {msg}", flush=True)
@@ -121,10 +122,10 @@ def is_media_post(d: Dict[str, Any]) -> bool:
     post_hint = d.get("post_hint", "")
     return bool(d.get("is_video") or post_hint in ("image", "hosted:video") or d.get("is_gallery"))
 
-# ------------------------ OAuth и вызовы API ------------------------
+# ------------------------ OAuth ------------------------
 
 def oauth_token(force: bool = False) -> str:
-    """Получить (и кешировать) OAuth токен через password grant c scope=read."""
+    """Получить (и кешировать) OAuth токен через password grant (scope=read)."""
     global _OAUTH_TOKEN, _TOKEN_EXP
     now = int(time.time())
     if not force and _OAUTH_TOKEN and now < _TOKEN_EXP - 30:
@@ -138,7 +139,7 @@ def oauth_token(force: bool = False) -> str:
         "grant_type": "password",
         "username": REDDIT_USERNAME,
         "password": REDDIT_PASSWORD,
-        "scope": "read",  # явно просим read
+        "scope": "read",
     }
     headers = {"User-Agent": USER_AGENT}
     r = requests.post(REDDIT_AUTH, auth=auth, data=data, headers=headers, timeout=30)
@@ -156,9 +157,10 @@ def oauth_token(force: bool = False) -> str:
     log("Obtained Reddit OAuth token")
     return token
 
-def reddit_get(path: str, params: Optional[dict] = None, max_retries: int = 4) -> requests.Response:
-    """GET на oauth.reddit.com с ретраями на 403/429/5xx и печатью ошибок."""
-    # гарантируем raw_json=1
+# ------------------------ Двухконтурный fetch JSON ------------------------
+
+def reddit_json_via_oauth(path: str, params: Optional[dict] = None, max_retries: int = 3) -> dict:
+    """GET oauth.reddit.com с ретраями; кидает исключение, если не вышло."""
     params = dict(params or {})
     if "raw_json" not in params:
         params["raw_json"] = 1
@@ -175,51 +177,58 @@ def reddit_get(path: str, params: Optional[dict] = None, max_retries: int = 4) -
             "X-Reddit-Device-Id": _device_id,
         }
         r = session.get(url, headers=headers, params=params, timeout=30)
-
         if r.status_code < 400:
-            return r
-
-        # Диагностика
-        snippet = (r.text or "")[:500]
-        log(f"GET {url} -> {r.status_code} (attempt {attempt}/{max_retries}). Body: {snippet}")
-
+            return r.json()
+        # диагностика
+        log(f"OAuth GET {url} -> {r.status_code} (attempt {attempt}/{max_retries}). Body: {(r.text or '')[:400]}")
         if r.status_code == 401:
-            # токен протух — форс-обновим
             token = oauth_token(force=True)
         elif r.status_code in (403, 429) or 500 <= r.status_code < 600:
-            # подождём и повторим
-            time.sleep(backoff)
-            backoff *= 1.8
+            time.sleep(backoff); backoff *= 1.8
         else:
-            # другие ошибки — без ретраев
             break
+    r.raise_for_status()  # пробросит последнюю ошибку
 
+def reddit_json_via_proxy(path: str, params: Optional[dict] = None) -> dict:
+    """GET через Jina proxy, который скачивает страничку Reddit и отдаёт её контент."""
+    params = dict(params or {})
+    if "raw_json" not in params:
+        params["raw_json"] = 1
+    # Собираем URL вида: https://r.jina.ai/http://www.reddit.com<path>?...
+    url = f"{JINA_PROXY}{REDDIT_WEB}{path}"
+    r = session.get(url, params=params, timeout=30, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
     r.raise_for_status()
-    return r
-
-def ensure_token_works() -> None:
-    """Пробный вызов /api/v1/me для быстрой диагностики прав/токена."""
+    # Jina отдаёт текст ответа той страницы. Для JSON это JSON-строка.
+    text = r.text
     try:
-        r = reddit_get("/api/v1/me", params={"raw_json": 1})
-        _ = r.json()
-        log("Token check OK (/api/v1/me)")
-    except Exception as e:
-        log(f"Token check failed: {e}")
-        raise
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Бывает, что Jina отдаёт HTML — попробуем вычленить JSON-блок (редко нужно).
+        raise RuntimeError(f"Proxy returned non-JSON for {path}: {text[:400]}")
 
-# ------------------------ Работа с комментариями ------------------------
+def reddit_json(path: str, params: Optional[dict] = None) -> dict:
+    """
+    Универсальный вызов:
+    - пытаемся OAuth;
+    - на падении — уходим в proxy;
+    - логируем, каким путём пошли.
+    """
+    try:
+        js = reddit_json_via_oauth(path, params=params)
+        return js
+    except Exception as e:
+        log(f"OAuth path failed for {path}: {e}. Falling back to proxy…")
+        js = reddit_json_via_proxy(path, params=params)
+        return js
+
+# ------------------------ Комментарии ------------------------
 
 def fetch_top_comments(post_id36: str, count: int) -> List[Tuple[str, int, str]]:
-    """
-    Возвращает [(author, score, body), ...] для top-level комментариев,
-    отсортированных по score (desc). Удалённые/стикнутые/мод-комменты пропускаем.
-    """
     if not post_id36 or count <= 0:
         return []
     path = f"/comments/{post_id36}.json"
     params = {"sort": "top", "limit": 50, "raw_json": 1}
-    res = reddit_get(path, params=params)
-    js = res.json()
+    js = reddit_json(path, params=params)
     if not isinstance(js, list) or len(js) < 2:
         return []
 
@@ -244,7 +253,7 @@ def fetch_top_comments(post_id36: str, count: int) -> List[Tuple[str, int, str]]
     rows.sort(key=lambda x: x[1], reverse=True)
     return rows[:max(0, count)]
 
-# ------------------------ Отправка в Telegram ------------------------
+# ------------------------ Telegram ------------------------
 
 def tg_send(endpoint: str, payload: dict, timeout: int = 60) -> requests.Response:
     assert TG_API and CHAT_ID, "Telegram config missing"
@@ -277,7 +286,10 @@ def first_gallery_image(post: Dict[str, Any]) -> Optional[str]:
         return None
     return None
 
-# ------------------------ Компоновка подписи/сообщения ------------------------
+# ------------------------ Компоновка подписи ------------------------
+
+TG_CAPTION_LIMIT = 1024
+TG_MESSAGE_LIMIT = 4096
 
 def compose_caption(d: Dict[str, Any]) -> Tuple[str, bool]:
     """Собирает текст под лимиты Telegram. Возвращает (text, is_media)."""
@@ -301,7 +313,7 @@ def compose_caption(d: Dict[str, Any]) -> Tuple[str, bool]:
     media = is_media_post(d)
     hard_limit = TG_CAPTION_LIMIT if media else TG_MESSAGE_LIMIT
 
-    # Посчитаем «фикс» и бюджет
+    # База и бюджет
     base_parts = [title_block]
     if body:
         base_parts.append("--------")
@@ -318,7 +330,7 @@ def compose_caption(d: Dict[str, Any]) -> Tuple[str, bool]:
         body_block = html.escape(body[:fit])
         budget -= len(body_block)
 
-    # Вставим комментарии (через разделитель)
+    # Комментарии (с разделителем)
     comment_blocks: List[str] = []
     if top_comments and budget > 0:
         sep_len = len("\n--------\n")
@@ -341,7 +353,7 @@ def compose_caption(d: Dict[str, Any]) -> Tuple[str, bool]:
                     break
                 per_limit = max(min_per_limit, int(per_limit * 0.8))
 
-    # Сборка финального текста
+    # Сборка
     out = [title_block]
     if body_block:
         out.append("--------")
@@ -357,7 +369,7 @@ def compose_caption(d: Dict[str, Any]) -> Tuple[str, bool]:
 
     return text, media
 
-# ------------------------ Основная логика отправки ------------------------
+# ------------------------ Основная логика ------------------------
 
 def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
     if d.get("stickied"):
@@ -379,7 +391,6 @@ def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
     sent_ok = False
     try:
         if media:
-            # Видео Reddit
             if is_video or post_hint == "hosted:video":
                 rv = (root.get("secure_media") or root.get("media") or {}).get("reddit_video") or {}
                 fallback = rv.get("fallback_url")
@@ -390,8 +401,6 @@ def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
                     text = f"{caption}\n\n{html.escape(url or ('https://www.reddit.com' + permalink))}"
                     r = send_message(text)
                     sent_ok = r.ok
-
-            # Галерея
             elif is_gallery:
                 img = first_gallery_image(root)
                 if img:
@@ -401,12 +410,9 @@ def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
                     text = f"{caption}\n\n{html.escape(url or ('https://www.reddit.com' + permalink))}"
                     r = send_message(text)
                     sent_ok = r.ok
-
-            # Картинка
             elif post_hint == "image" and url:
                 r = send_photo(url, caption)
                 sent_ok = r.ok
-
             else:
                 text = f"{caption}\n\n{html.escape(url or ('https://www.reddit.com' + permalink))}"
                 r = send_message(text)
@@ -433,8 +439,7 @@ def handle_post(d: Dict[str, Any], state: Dict[str, bool]) -> None:
 def fetch_listing(subreddit: str, listing: str, limit: int) -> List[Dict[str, Any]]:
     path = f"/r/{subreddit}/{listing}.json"
     params = {"limit": limit, "raw_json": 1}
-    res = reddit_get(path, params=params)
-    js = res.json()
+    js = reddit_json(path, params=params)
     children = js.get("data", {}).get("children", [])
     return [c["data"] for c in children]
 
@@ -444,11 +449,9 @@ def main():
     if not BOT_TOKEN or not CHAT_ID:
         raise SystemExit("Missing BOT_TOKEN or CHAT_ID env variables")
 
-    # Быстрая проверка токена/прав — чтобы ловить 403 раньше и видеть тело ответа
-    ensure_token_works()
-
     state = load_state()
     posts = fetch_listing(SUBREDDIT, LISTING, 25)
+    # отправляем старые → новые
     for d in reversed(posts):
         handle_post(d, state)
 
