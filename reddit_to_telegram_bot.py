@@ -195,12 +195,6 @@ def send_photo(photo_url: str, caption: str) -> requests.Response:
 def send_video(video_url: str, caption: str) -> requests.Response:
     return tg_send("sendVideo", {"video": video_url, "caption": caption, "parse_mode": "HTML", "supports_streaming": True}, timeout=120)
 
-def send_startup_ping() -> None:
-    try:
-        send_message("🚀 Бот запущен: проверка связи")
-    except Exception as e:
-        log(f"Startup ping failed: {e}")
-
 # -------- Media helpers --------
 def first_gallery_image(post: Dict[str, Any]) -> Optional[str]:
     md = post.get("media_metadata"); gd = post.get("gallery_data")
