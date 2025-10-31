@@ -1,16 +1,53 @@
-name: Reddit to Telegram (OAuth)
+name: run
 
 on:
-  workflow_dispatch:
+  # каждые 15 минут
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/15 * * * *"
+  # запуск вручную из вкладки Actions
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+
+    env:
+      # --- Telegram ---
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      CHAT_ID: ${{ secrets.CHAT_ID }}
+
+      # --- Reddit (OAuth; fallback на прокси всё равно есть) ---
+      REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+      REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+      REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
+      REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
+
+      # --- Поведение бота ---
+      USER_AGENT: "VM-NBA-Bot/2.6 (by u/your_username; GitHub Actions)"
+      FORCE_PROXY: "1"        # ходим через https://r.jina.ai/https://www.reddit.com/...
+      PING_ON_START: "0"      # стартовый пинг выключен
+      FORCE_POST_ONE: "0"     # можно включить "1" для диагностики (принудительно отправить 1 пост)
+      MEDIA_MODE: "auto"      # "auto" или "text_only" (диагностика)
+      CLEAR_STATE: "0"        # "1" — очищает state перед запуском
+
+      # --- Лента и формат ---
+      SUBREDDIT: "nba"
+      LISTING: "hot"
+      LIMIT: "25"
+
+      CHAR_LIMIT: "200"        # лимит заголовка (жирным)
+      BODY_CHAR_LIMIT: "600"   # объём превью текста поста
+      COMMENTS_COUNT: "3"      # сколько топ-комментариев добавлять
+      COMMENT_CHAR_LIMIT: "220"
+      STATE_FILE: "state_reddit_ids.json"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,33 +63,18 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run bot
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
-          REDDIT_PASSWORD: ${{ secrets.REDDIT_PASSWORD }}
-          USER_AGENT: "VM-NBA-Bot/2.3 (by u/znambo; GitHub Actions)"
-          FORCE_PROXY: "1"
-          PING_ON_START: "1"       # отправить тестовое сообщение при старте
-          FORCE_POST_ONE: "1"      # игнорировать state и отправить 1 верхний пост принудительно
-          MEDIA_MODE: "auto"       # можно временно поставить "text_only" для диагностики
-          SUBREDDIT: nba
-          LISTING: hot
-          LIMIT: "25"
-          CHAR_LIMIT: "200"
-          STATE_FILE: state_reddit_ids.json
-          # USER_AGENT: "VM-Reddit-TG-Bot/2.0 (by u/YourUserName; GitHub Actions)" # <- можно вынести в Variables
         run: |
           python reddit_to_telegram_bot.py
 
-      - name: Commit state
+      - name: Commit updated state (if changed)
+        if: ${{ always() }}
         run: |
-          if [[ -n "$(git status --porcelain state_reddit_ids.json)" ]]; then
+          if [[ -n "$(git status --porcelain "$STATE_FILE")" ]]; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add state_reddit_ids.json
+            git add "$STATE_FILE"
             git commit -m "chore: update posted Reddit IDs [skip ci]"
             git push
+          else
+            echo "No state changes to commit."
           fi
